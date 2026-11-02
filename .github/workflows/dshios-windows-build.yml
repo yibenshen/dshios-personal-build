@@ -1,0 +1,150 @@
+name: Build DSHIOS unsigned IPA
+
+# Put this file in .github/workflows/dshios-windows-build.yml in your own repo.
+# No Apple credentials, signing certificates, API keys or paid services required
+# by this workflow. It builds an UNSIGNED app, not an install-ready signed IPA.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dshios-personal-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: DSHIOS basic edition / unsigned
+    runs-on: xcode-27
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      SOURCE_COMMIT: bac298478545db7bb8762e82ba3db52f50ac6a5d
+    steps:
+      - name: Check out pinned upstream source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: everettjf/dsh-ios
+          ref: bac298478545db7bb8762e82ba3db52f50ac6a5d
+          persist-credentials: false
+
+      - name: Verify Apple Silicon and Xcode
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          xcodebuild -version
+          xcodebuild -version | head -1 | grep -E '^Xcode 27([. ]|$)'
+          node --version
+          npm --version
+          node -e 'if (Number(process.versions.node.split(".")[0]) < 20) process.exit(1)'
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          brew install meson ninja lld
+          echo "$(brew --prefix lld)/bin" >> "$GITHUB_PATH"
+          gem install --user-install xcodeproj --no-document
+          echo "$(ruby -r rubygems -e 'puts Gem.user_dir')/bin" >> "$GITHUB_PATH"
+          ruby -r xcodeproj -e 'puts "xcodeproj #{Xcodeproj::VERSION}"'
+
+      - name: Prepare minimal-entitlement basic edition
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import plistlib
+
+          entitlements = Path('app/DSH.entitlements')
+          data = plistlib.loads(entitlements.read_bytes())
+          expected = {
+              'com.apple.developer.healthkit',
+              'com.apple.developer.private-cloud-compute',
+          }
+          if set(data) != expected:
+              raise SystemExit(f'Unexpected entitlement set; review before building: {sorted(data)}')
+          entitlements.write_bytes(plistlib.dumps({}))
+
+          coordinator = Path('app/DSHBootCoordinator.m')
+          source = coordinator.read_text()
+          target = '[DSHHealthCapability installOn:bridge];'
+          if source.count(target) != 1:
+              raise SystemExit('Health bridge patch does not match pinned source')
+          coordinator.write_text(source.replace(
+              target,
+              '// Basic sideload edition: HealthKit bridge intentionally disabled.'
+          ))
+          assert plistlib.loads(entitlements.read_bytes()) == {}
+          assert target not in coordinator.read_text()
+          print('PCC entitlement removed; HealthKit entitlement and bridge disabled.')
+          PY
+
+      - name: Build Linux emulator and bundled guest image
+        run: |
+          set -euo pipefail
+          command -v ld.lld
+          make rootfs
+          test -s build/root.tar.gz
+          shasum -a 256 build/root.tar.gz
+
+      - name: Build unsigned iPhone app
+        run: |
+          set -euo pipefail
+          make project
+          xcodebuild \
+            -project DSH.xcodeproj \
+            -scheme DSH \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            ARCHS=arm64 \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= \
+            DEVELOPMENT_TEAM= \
+            DSH_DEVELOPMENT_TEAM= \
+            ENABLE_USER_SCRIPT_SANDBOXING=NO \
+            build
+
+      - name: Package unsigned IPA and build notes
+        run: |
+          set -euo pipefail
+          APP="build/DerivedData/Build/Products/Release-iphoneos/DSH.app"
+          test -d "$APP"
+          test -s "$APP/root.tar.gz"
+          test -s "$APP/DSH"
+          mkdir -p build/ipa/Payload dist
+          cp -R "$APP" build/ipa/Payload/DSH.app
+          (
+            cd build/ipa
+            COPYFILE_DISABLE=1 /usr/bin/zip -qry -y ../../dist/DSHIOS-basic-unsigned.ipa Payload
+          )
+          cp LICENSE dist/LICENSE
+          cp LICENSE.md dist/THIRD-PARTY-LICENSES.md
+          {
+            echo 'DSHIOS basic edition - UNSIGNED IPA'
+            echo "Source: https://github.com/everettjf/dsh-ios/tree/$SOURCE_COMMIT"
+            echo "Commit: $(git rev-parse HEAD)"
+            echo 'Changes: removed PCC and HealthKit entitlements; disabled HealthKit bridge.'
+            echo 'Not signed, not installed, and not tested on an iPhone by this workflow.'
+            echo 'Requires local Apple signing before installing. No Apple credentials used in CI.'
+            echo 'Other iOS device capabilities retain upstream permission gates.'
+            echo 'Performance is experimental. API requests still need an online model provider.'
+            xcodebuild -version
+            sw_vers
+          } > dist/BUILD-NOTES.txt
+          (cd dist && shasum -a 256 DSHIOS-basic-unsigned.ipa > SHA256SUMS.txt)
+          /usr/bin/unzip -t dist/DSHIOS-basic-unsigned.ipa
+          ls -lh dist
+
+      - name: Upload unsigned IPA artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: DSHIOS-basic-unsigned
+          path: dist/
+          if-no-files-found: error
+          retention-days: 3
